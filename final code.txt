@@ -1,0 +1,302 @@
+from google.colab import drive
+drive.mount('/content/drive')
+!pip install librosa
+!pip install SpeechRecognition
+!pip install pydub
+!pip install xgboost
+!apt-get install ffmpeg
+!pip install scikit-learn
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import librosa
+import os
+import glob
+import random
+import speech_recognition as sr
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Dropout, Conv1D, MaxPooling1D, BatchNormalization, Flatten,Bidirectional,LSTM
+from tensorflow.keras.callbacks import EarlyStopping
+
+from xgboost import XGBClassifier
+RAVDESS_PATH="/content/drive/MyDrive/vocalfusion_dataset/dataset/archive"
+files = glob.glob(RAVDESS_PATH+"/Actor_*/*.wav")
+
+print("Total audio files:",len(files))
+print(files[:5])
+def extract_features(file):
+
+    X, sr = librosa.load(file, sr=16000)
+
+    mfcc = librosa.feature.mfcc(y=X, sr=sr, n_mfcc=40)
+
+    mfcc_mean = np.mean(mfcc, axis=1)
+    mfcc_std = np.std(mfcc, axis=1)
+
+    delta = librosa.feature.delta(mfcc)
+    delta_mean = np.mean(delta, axis=1)
+    delta_std = np.std(delta, axis=1)
+
+    delta2 = librosa.feature.delta(mfcc, order=2)
+    delta2_mean = np.mean(delta2, axis=1)
+    delta2_std = np.std(delta2, axis=1)
+
+    chroma = librosa.feature.chroma_stft(y=X, sr=sr)
+    chroma_mean = np.mean(chroma, axis=1)
+
+
+    mel = librosa.feature.melspectrogram(y=X, sr=sr, n_mels=64)
+    mel_db = librosa.power_to_db(mel)
+    mel_mean = np.mean(mel_db, axis=1)
+
+    contrast = librosa.feature.spectral_contrast(y=X, sr=sr)
+    contrast_mean = np.mean(contrast, axis=1)
+
+    zcr = np.mean(librosa.feature.zero_crossing_rate(X))
+
+    centroid = np.mean(librosa.feature.spectral_centroid(y=X, sr=sr))
+
+    rolloff = np.mean(librosa.feature.spectral_rolloff(y=X, sr=sr))
+
+    pitch = librosa.yin(X, fmin=50, fmax=300)
+    pitch_mean = np.mean(pitch)
+    pitch_std = np.std(pitch)
+
+    return np.hstack([
+        mfcc_mean,
+        mfcc_std,
+        delta_mean,
+        delta_std,
+        delta2_mean,
+        delta2_std,
+        chroma_mean,
+        mel_mean[:40],
+        contrast_mean,
+        zcr,
+        centroid,
+        rolloff,
+        pitch_mean,
+        pitch_std
+    ])
+def get_gender(actor_id):
+
+    actor_id = int(actor_id)
+
+    if actor_id % 2 == 0:
+        return 1
+    else:
+        return 0
+
+
+def get_age(actor_id):
+
+    actor_id = int(actor_id)
+
+    if actor_id <= 8:
+        return 0
+    elif actor_id <= 16:
+        return 1
+    else:
+        return 2
+X = []
+y_emotion = []
+y_gender = []
+y_age = []
+
+for file in glob.glob("/content/drive/MyDrive/vocalfusion_dataset/dataset/archive" + "/Actor_*/*.wav"):
+
+    filename = os.path.basename(file)
+
+    parts = filename.split("-")
+
+    emotion = int(parts[2]) - 1
+
+    actor_id = os.path.basename(os.path.dirname(file)).split("_")[1]
+
+    features = extract_features(file)
+
+    X.append(features)
+
+    y_emotion.append(emotion)
+    y_gender.append(get_gender(actor_id))
+    y_age.append(get_age(actor_id))
+
+print("Total Samples:", len(X))
+X = np.array(X)
+y_emotion = np.array(y_emotion)
+y_gender = np.array(y_gender)
+y_age = np.array(y_age)
+
+
+X_train, X_test, y_em_train, y_em_test, y_gen_train, y_gen_test, y_age_train, y_age_test = train_test_split(
+    X, y_emotion, y_gender, y_age,
+    test_size=0.2,
+    stratify=y_emotion,
+    random_state=42
+)
+scaler = StandardScaler()
+
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
+
+# reshape for CNN
+
+X_train_cnn = X_train[..., np.newaxis]
+X_test_cnn = X_test[..., np.newaxis]
+
+input_layer = Input(shape=(X_train_cnn.shape[1],1))
+input_layer = Input(shape=(X_train_cnn.shape[1],1))
+
+# CNN Layer 1
+x = Conv1D(128,5,activation="relu")(input_layer)
+x = BatchNormalization()(x)
+x = MaxPooling1D(2)(x)
+x = Dropout(0.3)(x)
+
+# CNN Layer 2
+x = Conv1D(256,3,activation="relu")(x)
+x = BatchNormalization()(x)
+x = MaxPooling1D(2)(x)
+x = Dropout(0.3)(x)
+
+# BiLSTM Layer
+x = Bidirectional(LSTM(128, return_sequences=False))(x)
+
+# Dense Layer
+x = Dense(128,activation="relu")(x)
+x = Dropout(0.4)(x)
+
+emotion_output = Dense(8,activation="softmax")(x)
+
+emotion_model = Model(inputs=input_layer,outputs=emotion_output)
+
+emotion_model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.0003),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+emotion_model.summary()
+early_stop = EarlyStopping(
+    monitor="val_loss",
+    patience=10,
+    restore_best_weights=True
+)
+history = emotion_model.fit(
+    X_train_cnn,
+    y_em_train,
+    epochs=100,
+    batch_size=32,
+    validation_data=(X_test_cnn,y_em_test),
+    callbacks=[early_stop]
+)
+
+# Evaluate Emotion
+emotion_loss, emotion_acc = emotion_model.evaluate(X_test_cnn,y_em_test)
+
+print("Emotion Accuracy:",emotion_acc*100,"%")
+gender_model = XGBClassifier(
+    n_estimators=400,
+    learning_rate=0.05,
+    max_depth=5,
+    subsample=0.9,
+    colsample_bytree=0.9,
+    objective="binary:logistic",
+    eval_metric="logloss"
+)
+
+gender_model.fit(X_train, y_gen_train)
+
+gender_pred = gender_model.predict(X_test)
+
+gender_accuracy = accuracy_score(y_gen_test, gender_pred)
+
+print("Gender Accuracy:", gender_accuracy*100, "%")
+age_model = XGBClassifier(
+    n_estimators=600,
+    learning_rate=0.03,
+    max_depth=6,
+    subsample=0.9,
+    colsample_bytree=0.9,
+    gamma=0.2,
+    objective="multi:softmax",
+    num_class=3,
+    eval_metric="mlogloss"
+)
+
+age_model.fit(X_train, y_age_train)
+
+age_pred = age_model.predict(X_test)
+
+age_accuracy = accuracy_score(y_age_test, age_pred)
+
+print("Age Accuracy:", age_accuracy*100, "%")
+def speech_to_text(file):
+
+    r = sr.Recognizer()
+
+    with sr.AudioFile(file) as source:
+        audio = r.record(source)
+
+    try:
+        return r.recognize_google(audio)
+    except:
+        return "Speech not recognized"
+
+emotion_names = [
+"neutral","calm","happy","sad",
+"angry","fearful","disgust","surprised"
+]
+
+gender_names = ["Male","Female"]
+
+age_names = ["Young","Adult","Senior"]
+
+
+def predict_all(file):
+
+    feat = extract_features(file)
+
+    feat_scaled = scaler.transform([feat])
+
+    # CNN input
+    feat_cnn = feat_scaled[...,np.newaxis]
+
+    emotion = np.argmax(emotion_model.predict(feat_cnn))
+
+    gender = gender_model.predict(feat_scaled)[0]
+
+    age = age_model.predict(feat_scaled)[0]
+
+    text = speech_to_text(file)
+
+    return emotion_names[emotion], gender_names[gender], age_names[age], text
+files = glob.glob(RAVDESS_PATH + "/Actor_*/*.wav")
+
+test = random.choice(files)
+
+emotion, gender, age, text = predict_all(test)
+
+print("Audio File:", test)
+print("Emotion:", emotion)
+print("Gender:", gender)
+print("Age:", age)
+print("Speech:", text)
+overall_accuracy = (emotion_acc + gender_accuracy + age_accuracy) / 3
+
+print("Emotion Accuracy:", emotion_acc*100, "%")
+print("Gender Accuracy:", gender_accuracy*100, "%")
+print("Age Accuracy:", age_accuracy*100, "%")
+
+print("Overall Accuracy:", overall_accuracy*100, "%")
+
+
+
